@@ -28,9 +28,14 @@ OUT_GIF = ROOT.parent / "profile.gif"
 
 USERNAME = os.environ.get("CHESS_USERNAME", "xXCreativeIonCannonXx")
 VIEWPORT = (800, 1000)
-FRAME_COUNT = 45        # 45 frames
-FRAME_INTERVAL_MS = 66  # ~15 fps -> ~3 sec loop
-GIF_FRAME_DURATION = 66  # ms per frame in output gif
+# Literal real-time recording. The page runs at normal browser speed using
+# Math.random()-driven canvases (matching the live HTML exactly). We sample
+# every FRAME_INTERVAL_MS of real wall-clock time. There is no seamless
+# loop guarantee — the GIF will visibly snap when restarting, because the
+# original HTML never repeats either.
+FRAME_COUNT = 120
+FRAME_INTERVAL_MS = 50   # 20 fps
+GIF_FRAME_DURATION = 50  # play at the same rate we captured
 
 UA = "chessgif-bot/1.0 (github actions; contact: profile-gif)"
 
@@ -143,7 +148,18 @@ def render_template(data: dict) -> Path:
 # ---------- Playwright capture ----------
 
 async def capture_frames(html_path: Path) -> list[Image.Image]:
+    """
+    Literal real-time recording.
+
+    Loads the page normally, lets it run at real browser speed (so the
+    Math.random()-driven canvases behave exactly like the live HTML), and
+    takes a screenshot every FRAME_INTERVAL_MS of real wall-clock time.
+    Captures FRAME_COUNT frames total. The GIF plays back at the same
+    rate, so playback speed == live page speed.
+    """
     frames: list[Image.Image] = []
+    total_ms = FRAME_COUNT * FRAME_INTERVAL_MS
+
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         ctx = await browser.new_context(
@@ -152,15 +168,26 @@ async def capture_frames(html_path: Path) -> list[Image.Image]:
         )
         page = await ctx.new_page()
         await page.goto(html_path.absolute().as_uri(), wait_until="networkidle")
-        # Let fonts + canvases warm up
-        await page.wait_for_timeout(1500)
+        await page.evaluate("document.fonts.ready")
+        # Let fonts + canvases warm up before sampling
+        await page.wait_for_timeout(800)
 
+        # Strict per-frame schedule against the asyncio event loop clock so
+        # screenshot capture latency doesn't accumulate drift.
+        loop = asyncio.get_event_loop()
+        t0 = loop.time()
         for i in range(FRAME_COUNT):
+            target = t0 + (i * FRAME_INTERVAL_MS) / 1000
+            now = loop.time()
+            if target > now:
+                await asyncio.sleep(target - now)
             png = await page.screenshot(type="png", full_page=False)
-            frames.append(Image.open(io.BytesIO(png)).convert("P", palette=Image.ADAPTIVE, colors=128))
-            await page.wait_for_timeout(FRAME_INTERVAL_MS)
+            frames.append(
+                Image.open(io.BytesIO(png)).convert("P", palette=Image.ADAPTIVE, colors=128)
+            )
 
         await browser.close()
+    print(f"captured {len(frames)} frames over {total_ms}ms real time")
     return frames
 
 
